@@ -1,20 +1,22 @@
-import logging
-from BaseClasses import Region, Tutorial
-from Options import OptionError
-from worlds.AutoWorld import WebWorld, World
-from .items import OsuItem, item_data_table, item_table, osu_song_data, osu_song_pool, find_beatmapset
-from .locations import OsuLocation, location_table, location_data_table
-from .options import OsuOptions
 from math import floor
-from copy import deepcopy, copy
-from worlds.LauncherComponents import Component, components, Type
+
+from BaseClasses import Region, Tutorial
+from rule_builder.rules import Has
+
+from ..AutoWorld import WebWorld, World
+from ..LauncherComponents import Component, Type, components
+from .items import OsuItem, OsuItemKind, create_non_song_item, create_song_item, get_all_items
+from .locations import OsuLocation
+from .options import OsuOptions
+from .song_selection import DifficultySync, SongChoice, SongSelectionRules
+from .songs import get_all_songs, get_song_locations
 
 
 def run_client():
-    from worlds.LauncherComponents import launch
+    from ..LauncherComponents import launch
+    from .client import client
 
-    from .client import main
-    launch(main, "osu!Client")
+    launch(client.main, "osu!Client")
 
 
 components.append(Component("osu!Client", func=run_client, component_type=Type.CLIENT))
@@ -29,19 +31,9 @@ class OsuWebWorld(WebWorld):
             language="English",
             file_name="guide_en.md",
             link="guide/en",
-            authors=["Kanave"]
+            authors=["Kanave"],
         )
     ]
-
-
-class OsuMode:
-    def __init__(self, minimum_difficulty: int, maximum_difficulty: int, exclude: int):
-        if exclude:
-            self.minimum_difficulty = -1
-            self.maximum_difficulty = -1
-            return
-        self.minimum_difficulty = minimum_difficulty
-        self.maximum_difficulty = maximum_difficulty
 
 
 class OsuWorld(World):
@@ -54,112 +46,84 @@ class OsuWorld(World):
     game = "osu!"
     options_dataclass = OsuOptions
     options: OsuOptions
-    data_version = 3
     web = OsuWebWorld()
 
-    location_name_to_id = location_table
-    item_name_to_id = item_table
-    modes: dict[str, OsuMode]
-    pairs: dict
-    starting_songs: list
-    additional_songs: list
+    origin_region_name = "Song Select"
+    location_name_to_id = get_song_locations()
+    item_name_to_id = get_all_items()
+    all_songs = get_all_songs()
+
+    selector: SongSelectionRules
+    starting_songs: list[SongChoice]
+    additional_songs: list[SongChoice]
+    victory_song_id: int
     location_count: int
-    disable_difficulty_reduction: bool
 
     def generate_early(self):
-        self.pairs = {}
-        song_pool = osu_song_pool.copy()
-        self.modes = {}
+        self.selector = SongSelectionRules(self.random)
         self.starting_songs = []
         self.additional_songs = []
-        self.disable_difficulty_reduction = bool(self.options.disable_difficulty_reduction.value)
-        self.modes['osu'] = OsuMode(self.options.minimum_difficulty_standard.value,
-                                    self.options.maximum_difficulty_standard.value, self.options.exclude_standard.value)
-        self.modes['fruits'] = OsuMode(self.options.minimum_difficulty_catch.value,
-                                       self.options.maximum_difficulty_catch.value, self.options.exclude_catch.value)
-        self.modes['taiko'] = OsuMode(self.options.minimum_difficulty_taiko.value,
-                                      self.options.maximum_difficulty_taiko.value, self.options.exclude_taiko.value)
-        self.modes['4k'] = OsuMode(self.options.minimum_difficulty_4k.value,
-                                   self.options.maximum_difficulty_4k.value, self.options.exclude_4k.value)
-        self.modes['7k'] = OsuMode(self.options.minimum_difficulty_7k.value,
-                                   self.options.maximum_difficulty_7k.value, self.options.exclude_7k.value)
-        self.modes['other'] = OsuMode(self.options.minimum_difficulty_other.value,
-                                      self.options.maximum_difficulty_other.value,
-                                      self.options.exclude_other_keys.value)
-        starting_song_count = self.options.starting_songs
-        additional_song_count = self.options.additional_songs
-        song_count = additional_song_count+starting_song_count
 
-        # Get the valid songs and shuffle them
-        song_data_raw = self.get_eligible_songs()
-        self.random.shuffle(song_data_raw)
+        self.selector.starting_songs = self.options.starting_songs.value
+        self.selector.additional_songs = self.options.additional_songs.value
 
-        # Make sure we have enough songs
-        potiental_song_count = len(song_data_raw)+len(self.options.include_songs.value)
-        if potiental_song_count < (song_count + 1):
-            # If we don't have atleast 16 more than the requesting starting amount, we can't lower it enough.
-            if potiental_song_count < starting_song_count+16:
-                raise OptionError(f"Player {self.player}'s settings cannot generate enough songs, their settings only "
-                                f"allow {len(song_data_raw)+len(self.options.include_songs.value)} out of " 
-                                f"{song_count+1} requested songs, or the {starting_song_count+16} minimum songs.")
-            else:
-                # Otherwise, we can lower the song count such that we have enough songs.
-                song_count = len(song_data_raw)+len(self.options.include_songs.value)-1
-                logging.warning(f"Player {self.player}'s settings cannot generate enough songs. Lowering Song count to"
-                                f" {song_count+1}.")
+        self.selector.duration_filter = (self.options.minimum_length.value, self.options.maximum_length.value)
+        self.selector.age_filter = (self.options.maximum_age.value, self.options.minimum_age.value)
+        self.selector.allow_explicit = bool(self.options.explicit_lyrics.value)
+        self.selector.allow_loved = bool(self.options.enable_loved.value)
 
-        # Put generic songs into the list
-        for song in song_pool[:starting_song_count]:
-            self.starting_songs.append(song)
-        for song in song_pool[starting_song_count:song_count]:
-            self.additional_songs.append(song)
+        if not self.options.exclude_standard:
+            self.selector.range_osu = (
+                self.options.minimum_difficulty_standard.value,
+                self.options.maximum_difficulty_standard.value,
+            )
 
-        include_list = []
-        # Handle Included Songs
-        if self.options.shuffle_included_songs:
-            for beatmapset in sorted(self.options.include_songs.value, key=int, reverse=True):
-                # First get the song data entry for the ID
-                song_entry = deepcopy(find_beatmapset(int(beatmapset)))
-                # Get the eligible difficulties, if there are any
-                eligibile_diffs = self.check_difficulties(song_entry)
-                if eligibile_diffs and self.options.difficulty_sync.value == 2:
-                    eligibile_diffs = [self.random.choice(eligibile_diffs)]
-                # if there are none, make all of them eligibile.
-                if not eligibile_diffs:
-                    eligibile_diffs = []
-                    for i in song_entry["beatmaps"]:
-                        eligibile_diffs.append(i['id'])
-                song_entry['diffs'] = eligibile_diffs
-                include_list.insert(0, song_entry)
+        if not self.options.exclude_catch:
+            self.selector.range_fruits = (
+                self.options.minimum_difficulty_catch.value,
+                self.options.maximum_difficulty_catch.value,
+            )
 
-            while len(include_list) < song_count + 1:
-                include_list.insert(0, song_data_raw.pop())
-            self.random.shuffle(include_list)
+        if not self.options.exclude_taiko:
+            self.selector.range_taiko = (
+                self.options.minimum_difficulty_taiko.value,
+                self.options.maximum_difficulty_taiko.value,
+            )
 
-        else:
-            include_list = deepcopy(song_data_raw)
-            for beatmapset in sorted(self.options.include_songs.value, key=int, reverse=True):
-                # First get the song data entry for the ID
-                song_entry = deepcopy(find_beatmapset(int(beatmapset)))
-                # Get the eligible difficulties, if there are any
-                eligibile_diffs = self.check_difficulties(song_entry)
-                if eligibile_diffs and self.options.difficulty_sync.value == 2:
-                    eligibile_diffs = [self.random.choice(eligibile_diffs)]
-                # if there are none, make all of them eligibile.
-                if not eligibile_diffs:
-                    eligibile_diffs = []
-                    for i in song_entry["beatmaps"]:
-                        eligibile_diffs.append(i['id'])
-                song_entry['diffs'] = eligibile_diffs
-                include_list.insert(self.options.starting_songs, song_entry)
+        if not self.options.exclude_4k:
+            self.selector.range_mania_4k = (
+                self.options.minimum_difficulty_4k.value,
+                self.options.maximum_difficulty_4k.value,
+            )
 
-        song_data = deepcopy(include_list)
+        if not self.options.exclude_7k:
+            self.selector.range_mania_7k = (
+                self.options.minimum_difficulty_7k.value,
+                self.options.maximum_difficulty_7k.value,
+            )
 
-        for generic_song, osu_song in zip((self.starting_songs + self.additional_songs + ["Victory"]), song_data):
-            self.pairs[generic_song] = osu_song
+        if not self.options.exclude_other_keys:
+            self.selector.range_mania_other = (
+                self.options.minimum_difficulty_other.value,
+                self.options.maximum_difficulty_other.value,
+            )
 
-        for song in self.starting_songs:
-            self.multiworld.push_precollected(self.create_item(song))
+        self.selector.difficulty_sync = DifficultySync(self.options.difficulty_sync.value)
+
+        self.selector.shuffle_included_songs = bool(self.options.shuffle_included_songs.value)
+        self.selector.included_songs = {int(song_id) for song_id in self.options.include_songs.value}
+        self.selector.excluded_songs = {int(song_id) for song_id in self.options.exclude_songs.value}
+
+        self.selector.verify_options()
+
+        # Song choosing and generation starts here
+        self.selector.apply_filters()
+
+        for choice in self.selector.pick_starting_songs():
+            self.starting_songs.append(choice)
+
+        for choice in self.selector.pick_additional_songs():
+            self.additional_songs.append(choice)
 
         self.location_count = len(self.starting_songs) + len(self.additional_songs)
         location_multiplier = 1 + (self.get_additional_item_percentage() / 100.0)
@@ -169,113 +133,89 @@ class OsuWorld(World):
         if self.location_count < minimum_location_count:
             self.location_count = minimum_location_count
 
-    def get_eligible_songs(self) -> list[dict]:
-        song_list = []
-        for beatmapset in osu_song_data:
-            eligibile_diffs = self.check_eligibility(beatmapset)
-            if not eligibile_diffs:
-                continue
+    def create_regions(self) -> None:
+        menu_region = Region(self.origin_region_name, self.player, self.multiworld)
+        self.multiworld.regions += [menu_region]
 
-            eligibile_beatmapset = copy(beatmapset)
-            if self.options.difficulty_sync.value == 2:  # 2 = Strict_random
-                eligibile_diffs = [self.random.choice(eligibile_diffs)]
-            eligibile_beatmapset['diffs'] = eligibile_diffs
-            song_list.append(eligibile_beatmapset)
+        all_selected_songs = self.starting_songs + self.additional_songs
+        two_item_location_count = self.location_count - len(all_selected_songs)
 
-        return song_list
+        # Make a region per song/album, then adds 1-2 item locations to them
+        for i, choice in enumerate(all_selected_songs):
+            region = Region(choice.song.full_name, self.player, self.multiworld)
+            self.multiworld.regions.append(region)
 
-    def check_eligibility(self, beatmapset):
-        # Check each of the settings to see if the song cannot be included
-        if str(beatmapset["id"]) in self.options.include_songs.value.union(self.options.exclude_songs.value):
-            return False  # Included Songs are handled elsewhere, and we don't want duplicates
-        if beatmapset["length"] > self.options.maximum_length:
-            return False
-        if beatmapset["length"] < self.options.minimum_length:
-            return False
-        if (not self.options.explicit_lyrics) and beatmapset["nsfw"]:
-            return False
-        if beatmapset["status"] == 'loved' and (not self.options.enable_loved):
-            return False
-        if not (self.options.minimum_age >= beatmapset["ranked_date"] >= self.options.maximum_age):
-            return False
-        # If the song is legal, start looking for difficulties
-        return self.check_difficulties(beatmapset)
+            menu_region.connect(region, choice.song.full_name, Has(choice.song.get_item_name()))
 
-    def check_difficulties(self, beatmapset):
-        found_difficulties = []
-        # Check each beatmap of the set individually
-        for difficulty in beatmapset["beatmaps"]:
-            mode = self.modes[difficulty['mode']]
-            # excluded modes will have -1 for both
-            if mode.minimum_difficulty <= difficulty['sr'] * 100 <= mode.maximum_difficulty:
-                found_difficulties.append(difficulty['id'])
-        if found_difficulties:
-            return found_difficulties
-        return False
+            # Up to 2 Locations are defined per song
+            n_locations = 2 if i < two_item_location_count else 1
+            for location_index in range(n_locations):
+                location_name = choice.song.get_location_name(location_index)
+                location_address = self.location_name_to_id[location_name]
 
-    def create_item(self, name: str) -> OsuItem:
-        return OsuItem(name, item_data_table[name].type, item_data_table[name].code, self.player)
+                location = OsuLocation(self.player, location_name, location_address, region)
+                region.locations.append(location)
+
+        # Pick a random song to be the victory one, then create an event
+        victory_song = self.random.choice(all_selected_songs).song
+        victory_region = self.get_region(victory_song.full_name)
+
+        has_victory_song = Has(victory_song.get_item_name())
+        can_play_victory_song = Has(OsuItemKind.PERFORMANCE_POINTS, self.get_music_sheet_win_count())
+        victory_region.add_event(
+            victory_song.full_name,
+            "Victory",
+            has_victory_song & can_play_victory_song,
+            location_type=OsuLocation,
+            item_type=OsuItem,
+        )
+
+        # Make sure the client knows which song is the victory one
+        self.victory_song_id = victory_song.id
 
     def create_items(self) -> None:
-        song_keys_in_pool = self.additional_songs.copy()
-
         # Note: Item count will be off if plando is involved.
         item_count = self.get_music_sheet_count()
 
         # First add all goal song tokens
-        for _ in range(0, item_count):
-            self.multiworld.itempool.append(self.create_item("Performance Points"))
+        for _ in range(item_count):
+            self.multiworld.itempool.append(self.create_item(OsuItemKind.PERFORMANCE_POINTS))
 
-        # Next fill all remaining slots with song items
-        needed_item_count = self.location_count
-        while item_count < needed_item_count:
-            # If we have more items needed than keys, just iterate the list and add them all
-            if len(song_keys_in_pool) <= needed_item_count - item_count:
-                for key in song_keys_in_pool:
-                    self.multiworld.itempool.append(self.create_item(key))
+        # Precollect starting songs
+        for choice in self.starting_songs:
+            item = self.create_item(choice.song.get_item_name())
+            self.push_precollected(item)
 
-                item_count += len(song_keys_in_pool)
-                continue
+        # Add rest of the songs to the item pool
+        for choice in self.additional_songs:
+            item_name = choice.song.get_item_name()
+            self.multiworld.itempool.append(self.create_item(item_name))
 
-            # Otherwise add a random assortment of songs
-            self.random.shuffle(song_keys_in_pool)
-            for i in range(0, needed_item_count - item_count):
-                self.multiworld.itempool.append(self.create_item(song_keys_in_pool[i]))
+        item_count += len(self.additional_songs)
 
-            item_count = needed_item_count
+        # Next fill all remaining slots with filler items
+        items_needed = self.location_count - item_count
+        if items_needed:
+            for _ in range(0, self.location_count - item_count):
+                self.multiworld.itempool.append(self.create_filler())
 
-    def create_regions(self) -> None:
-        menu_region = Region("Menu", self.player, self.multiworld)
-        song_select_region = Region("Song Select", self.player, self.multiworld)
-        self.multiworld.regions += [menu_region, song_select_region]
-        menu_region.connect(song_select_region)
+    def create_item(self, name: str) -> OsuItem:
+        # Assume this is not a song item
+        item = create_non_song_item(name, self.player)
+        if item:
+            return item
 
-        all_selected_locations = self.starting_songs.copy()
-        included_song_copy = self.additional_songs.copy()
+        # If it is, resolve the song and create its item
+        song_id = self.item_name_to_id[name]
+        song = self.all_songs[song_id]
 
-        self.random.shuffle(included_song_copy)
-        all_selected_locations.extend(included_song_copy)
-
-        two_item_location_count = self.location_count - len(all_selected_locations)
-
-        # Make a region per song/album, then adds 1-2 item locations to them
-        for i in range(0, len(all_selected_locations)):
-            name = all_selected_locations[i]
-            region = Region(name, self.player, self.multiworld)
-            self.multiworld.regions.append(region)
-            song_select_region.connect(region, name, lambda state, place=name: state.has(place, self.player))
-
-            # Up to 2 Locations are defined per song
-            region.add_locations({name + " (Item 1)": location_data_table[name + " (Item 1)"].address}, OsuLocation)
-            if i < two_item_location_count:
-                region.add_locations({name + " (Item 2)": location_data_table[name + " (Item 2)"].address}, OsuLocation)
+        return create_song_item(song, self.player)
 
     def get_filler_item_name(self) -> str:
-        return "Circle"
+        return OsuItemKind.CIRCLE
 
     def set_rules(self) -> None:
-        self.multiworld.completion_condition[self.player] = lambda state: \
-            state.has("Performance Points", self.player, self.get_music_sheet_win_count())
+        self.set_completion_rule(Has("Victory"))
 
     def get_music_sheet_count(self) -> int:
         multiplier = self.options.performance_points_count_percentage / 100.0
@@ -291,12 +231,18 @@ class OsuWorld(World):
         return self.options.additional_item_percentage.value
 
     def fill_slot_data(self):
+        # The client needs to know which difficulties can be played when
+        # difficulty sync is enabled
+        selected_songs = self.starting_songs + self.additional_songs
+        difficulties = {choice.song.id: choice.difficulty_ids for choice in selected_songs}
+
         return {
-            "Pairs": self.pairs,
+            "PermittedBeatmaps": difficulties,
             "PreformancePointsNeeded": self.get_music_sheet_win_count(),
-            "DisableDifficultyReduction": self.disable_difficulty_reduction,
+            "VictorySong": self.victory_song_id,
+            "DisableDifficultyReduction": self.options.disable_difficulty_reduction.value,
             "DifficultySync": self.options.difficulty_sync.value,
             "DisallowConverts": self.options.disallow_converts.value,
             "MinimumGrade": self.options.minimum_grade.value,
-            "VersionNumber": "1.1b"
+            "VersionNumber": "1.1b",
         }

@@ -1,6 +1,8 @@
+from .songs import get_all_songs
 from Options import Toggle, Option, Range, Choice, DeathLink, ItemSet, OptionSet, PerGameCommonOptions
 from dataclasses import dataclass
-from .items import get_song_data
+
+from .song_selection import DifficultySync as DifficultySyncOptions
 
 
 class StartingSongs(Range):
@@ -69,10 +71,10 @@ class DifficultySync(Choice):
     Strict_Random - A randomly chosen difficulty within your range has to be played. To be used with /check_diff.
     """
     display_name = "Strict Difficulty Sync"
-    option_Off = 0
-    option_Strict_Any = 1
-    option_Strict_Random = 2
-    default = 0
+    option_Off = DifficultySyncOptions.OFF.value
+    option_Strict_Any = DifficultySyncOptions.STRICT_ANY.value
+    option_Strict_Random = DifficultySyncOptions.STRICT_RANDOM.value
+    default = DifficultySyncOptions.OFF.value
 
 
 class MinimumGrade(Choice):
@@ -276,14 +278,14 @@ class IncludeSongs(OptionSet):
     """Force a list of Beatmapsets to appear, each replacing a Random song. This setting is optional, overrides other settings, and only supports Featured Artist songs.
     Usage: ['123', '234', '345'], where each number is the id for the set."""
     display_name = "Include Songs"
-    valid_keys = {str(beatmapset['id']) for beatmapset in get_song_data()}
+    valid_keys = {str(beatmapset_id) for beatmapset_id in get_all_songs()}
 
 
 class ExcludeSongs(OptionSet):
     """List of Beatmapset IDs to exclude. Listed Beatmapset IDs cannot appear in the Rando.
     """
     display_name = "Exclude Songs"
-    valid_keys = {str(beatmapset['id']) for beatmapset in get_song_data()}
+    valid_keys = {str(beatmapset_id) for beatmapset_id in get_all_songs()}
 
 
 @dataclass

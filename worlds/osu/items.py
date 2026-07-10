@@ -1,66 +1,67 @@
-from typing import NamedTuple
+from enum import StrEnum
 
 from BaseClasses import Item, ItemClassification
 
-import json
+from .songs import OsuSong, get_song_items
 
-def load_text_file(name: str) -> str:
-    import pkgutil
-    return pkgutil.get_data(__name__, name).decode()
 
 class OsuItem(Item):
     game = "osu!"
 
 
-class OsuItemData(NamedTuple):
-    code: int | None = None
-    type: ItemClassification = ItemClassification.filler
+class OsuItemKind(StrEnum):
+    PERFORMANCE_POINTS = "Performance Points"
+    CIRCLE = "Circle"
+
+    @property
+    def code(self) -> int:
+        match self:
+            case self.PERFORMANCE_POINTS:
+                return 1
+            case self.CIRCLE:
+                return 2
+
+    @property
+    def classification(self) -> ItemClassification:
+        match self:
+            case self.PERFORMANCE_POINTS:
+                return ItemClassification.progression_skip_balancing
+            case self.CIRCLE:
+                return ItemClassification.filler
 
 
-SONG_DATA_CACHE = None
-def get_song_data() -> list[dict]:
-    global SONG_DATA_CACHE
+def create_non_song_item(name: str, player: int) -> OsuItem | None:
+    """
+    Creates a non-song `OsuItem`, returning `None` if the passed name does not
+    correspond to a non-song item.
+    """
 
-    if SONG_DATA_CACHE is not None:
-        return SONG_DATA_CACHE
+    non_song_items = [OsuItemKind.PERFORMANCE_POINTS, OsuItemKind.CIRCLE]
 
-    OsuSongData = load_text_file("OsuSongData.json")
-    packs = json.loads(OsuSongData)
-    beatmapsets = []
-    for pack in packs:
-        for beatmapset in pack["beatmapsets"]:
-            if beatmapset not in beatmapsets:
-                beatmapsets.append(beatmapset)
-    SONG_DATA_CACHE = beatmapsets
+    if name in non_song_items:
+        item_kind = OsuItemKind(name)
+        return OsuItem(name, item_kind.classification, item_kind.code, player)
 
-    return SONG_DATA_CACHE
+    return None
 
 
-def find_beatmapset(id) -> dict:
-    for beatmapset in osu_song_data:
-        if beatmapset["id"] == id:
-            return beatmapset
-    raise ValueError("Beatmap not in Song Data")
+def create_song_item(song: OsuSong, player: int) -> OsuItem:
+    """
+    Creates an `OsuItem` representing the specified song.
+    """
 
-osu_song_data = get_song_data()
-osu_song_max = 520
-osu_song_pool = []
+    return OsuItem(song.get_item_name(), ItemClassification.progression, song.id, player)
 
-item_data_table: dict[str, OsuItemData] = {
-    "Performance Points": OsuItemData(
-        code=726999999,
-        type=ItemClassification.progression_skip_balancing,
-    ),
-    "Circle": OsuItemData(
-        code=726999998,
-    ),
-}
 
-for i in range(osu_song_max):
-    item_data_table[f"Song {i+1}"] = OsuItemData(
-        code=727000000+i,
-        type=ItemClassification.progression,
-    )
-    osu_song_pool.append(f"Song {i+1}")
+def get_all_items() -> dict[str, int]:
+    """
+    Returns a dictionary mapping item names to "codes", unique item IDs. Song
+    item IDs match the beatmapset IDs, while very low numbers (maps that are
+    not FA) are used by non-song items.
+    """
 
-item_table = {name: data.code for name, data in item_data_table.items() if data.code is not None}
+    all_items = get_song_items()
+    for item in OsuItemKind:
+        all_items[item.value] = item.code
+
+    return all_items
